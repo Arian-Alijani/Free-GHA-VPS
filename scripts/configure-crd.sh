@@ -1,168 +1,133 @@
+
 #!/usr/bin/env bash
 # ============================================================
-#  Free GHA VPS - Configure Chrome Remote Desktop
-#  First run: uses auth code from start-host → instant connect
-#  Returning: uses saved credentials → instant connect
+# Free GHA VPS - Configure Chrome Remote Desktop
+# First run: Google auth code + PIN
+# Returning run: saved credentials + PIN
 # ============================================================
-set -uo pipefail
 
-PIN="${1:?❌ PIN is required. Pass it as the first argument.}"
-MIN_PIN_LEN=6
+set -Eeuo pipefail
 
-# ── Validate PIN ─────────────────────────────────────────────
-if [ ${#PIN} -lt $MIN_PIN_LEN ]; then
-  echo "❌ PIN/password must be at least $MIN_PIN_LEN characters"
+PIN="${1:-${CRD_PIN:-}}"
+AUTH_CODE="${AUTH_CODE:-${2:-}}"
+
+CRD_DIR="$HOME/.config/google-chrome-remote-desktop"
+START_HOST="/opt/google/chrome-remote-desktop/start-host"
+HOST_BIN="/opt/google/chrome-remote-desktop/chrome-remote-desktop"
+HOST_NAME="Free-GHA-VPS"
+REDIRECT_URL="https://remotedesktop.google.com/_/oauthredirect"
+
+# Validate PIN
+if [[ -z "$PIN" ]]; then
+  echo "ERROR: CRD PIN is missing."
   exit 1
 fi
 
-CRD_DIR="$HOME/.config/google-chrome-remote-desktop"
-mkdir -p "$CRD_DIR"
+# Chrome Remote Desktop requires a numeric PIN of at least 6 digits.
+if [[ ! "$PIN" =~ ^[0-9]{6,}$ ]]; then
+  echo "ERROR: PIN must contain at least 6 digits (numbers only)."
+  exit 1
+fi
 
-# ── Save PIN for reference ───────────────────────────────────
-echo "🔑 Setting CRD PIN..."
-echo "$PIN" > "$CRD_DIR/pin"
+# Mask temporary Google authorization code in GitHub Actions logs.
+if [[ -n "$AUTH_CODE" ]]; then
+  echo "::add-mask::$AUTH_CODE"
+fi
+
+mkdir -p "$CRD_DIR"
+chmod 700 "$CRD_DIR"
+
+printf '%s\n' "$PIN" > "$CRD_DIR/pin"
 chmod 600 "$CRD_DIR/pin"
 
-# ── Kill any existing CRD processes ──────────────────────────
-sudo pkill -f chrome-remote-desktop 2>/dev/null || true
-sleep 2
+# Check required binary
+if [[ ! -x "$HOST_BIN" ]]; then
+  echo "ERROR: Chrome Remote Desktop host binary not found:"
+  echo "$HOST_BIN"
+  exit 1
+fi
 
-# ── Check if we have saved credentials (returning user) ─────
-if [ -f "$CRD_DIR/Credentials" ] && [ -s "$CRD_DIR/Credentials" ]; then
-  echo "✅ Found saved CRD credentials — skipping authorization!"
-  echo "   Starting Chrome Remote Desktop..."
+# Returning user: use saved credentials
+if [[ -s "$CRD_DIR/Credentials" ]]; then
+  echo "Saved CRD credentials found."
+  echo "Starting existing Chrome Remote Desktop host..."
 
-  # Kill stale CRD processes first
-  sudo pkill -9 -f chrome-remote-desktop 2>/dev/null || true
+  "$HOST_BIN" --stop >/dev/null 2>&1 || true
   sleep 2
 
-  # Start CRD daemon in background using the correct start-host method
-  DISPLAY=:0 nohup /opt/google/chrome-remote-desktop/start-host \
-    --pin="$PIN" \
-    --name="Free-GHA-VPS" < /dev/null > /tmp/crd.log 2>&1 &
-  sleep 5
+  DISPLAY=:0 nohup "$HOST_BIN" --start \
+    </dev/null >/tmp/crd-start.log 2>&1 &
 
-  # Verify it's online
-  for i in $(seq 1 30); do
-    if pgrep -f "chrome-remote-desktop" > /dev/null; then
-      echo ""
-      echo "✅ Chrome Remote Desktop is ONLINE!"
-      echo "   🔗 Connect: https://remotedesktop.google.com/access"
-      echo "   🔑 PIN: ${PIN}"
+  for _ in $(seq 1 30); do
+    if pgrep -u "$(id -u)" -f 'chrome-remote-desktop' >/dev/null 2>&1; then
+      echo "Chrome Remote Desktop start command launched."
+      echo "Connect at: https://remotedesktop.google.com/access"
       exit 0
     fi
     sleep 2
   done
 
-  echo "⚠️  CRD starting... check remotedesktop.google.com/access in a moment"
-  exit 0
+  echo "ERROR: CRD did not appear to start."
+  echo "Check /tmp/crd-start.log"
+  exit 1
 fi
 
-# ── First-time setup: No credentials yet ─────────────────────
-echo "🆕 First-time setup — Chrome Remote Desktop needs authorization"
-echo ""
-
-# If start-host is available, try using it with the PIN
-if [ -x /opt/google/chrome-remote-desktop/start-host ]; then
-  echo "   Starting CRD host with PIN..."
-  DISPLAY=:0 nohup /opt/google/chrome-remote-desktop/start-host \
-    --pin="$PIN" \
-    --name="Free-GHA-VPS" > /tmp/crd.log 2>&1 &
-  CRD_PID=$!
-  sleep 5
-else
-  # Fallback: start the CRD daemon directly
-  nohup /opt/google/chrome-remote-desktop/chrome-remote-desktop --start > /tmp/crd.log 2>&1 &
-  CRD_PID=$!
-  sleep 5
+# First-time setup requires Google's authorization code
+if [[ -z "$AUTH_CODE" ]]; then
+  echo "ERROR: First-time setup requires Google's auth code."
+  echo
+  echo "1. Open https://remotedesktop.google.com/headless"
+  echo "2. Click Begin, then Authorize."
+  echo "3. Choose Debian Linux."
+  echo "4. Copy only the value after --code=."
+  echo "5. Run the workflow again and enter it in auth_code."
+  echo
+  echo "Do not share the code or paste the complete command."
+  exit 1
 fi
 
-# Try to extract the auth URL from CRD logs
-AUTH_URL=""
-MAX_AUTH_WAIT=60
-
-echo "🔍 Looking for authorization link..."
-for i in $(seq 1 $MAX_AUTH_WAIT); do
-  # CRD may output various URL patterns
-  AUTH_URL=$(grep -oP 'https://remotedesktop\.google\.com[^ "'\''<>]*' /tmp/crd.log 2>/dev/null | head -1 || true)
-
-  if [ -z "$AUTH_URL" ]; then
-    AUTH_URL=$(grep -oP 'https://accounts\.google\.com/o/oauth2[^ "'\''<>]*' /tmp/crd.log 2>/dev/null | head -1 || true)
-  fi
-
-  if [ -z "$AUTH_URL" ]; then
-    AUTH_URL=$(grep -oP 'https://[^ "'\''<>]*google[^ "'\''<>]*auth[^ "'\''<>]*' /tmp/crd.log 2>/dev/null | head -1 || true)
-  fi
-
-  if [ -n "$AUTH_URL" ]; then
-    break
-  fi
-
-  # Check if CRD crashed
-  if ! kill -0 $CRD_PID 2>/dev/null; then
-    break
-  fi
-
-  echo -n "."
-  sleep 1
-done
-
-echo ""
-
-if [ -n "$AUTH_URL" ]; then
-  # Display the auth URL prominently using GitHub Actions annotations
-  echo "::notice::🔗 AUTHORIZE YOUR VPS: ${AUTH_URL}"
-  echo ""
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  🔗  CLICK THIS LINK TO AUTHORIZE YOUR VPS:"
-  echo ""
-  echo "  ${AUTH_URL}"
-  echo ""
-  echo "  ⏱️  You have 3 minutes to click it!"
-  echo "  🔑  Your PIN: ${PIN}"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-else
-  # Fallback: guide user to the headless setup page
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo "  🔗  ONE-CLICK AUTHORIZATION NEEDED"
-  echo ""
-  echo "  Step 1: Open this link 👇"
-  echo "  https://remotedesktop.google.com/headless"
-  echo ""
-  echo "  Step 2: Sign in with Google → Click 'Next'"
-  echo "          → Choose 'Debian Linux' → Copy the command"
-  echo ""
-  echo "  Step 3: Just extract the --code value from the command"
-  echo "          It looks like: 4/0AX4XfWh..."
-  echo ""
-  echo "  Step 4: Re-run this workflow with the code as input!"
-  echo "  🔑  Your PIN: ${PIN}"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  echo ""
-  echo "::notice::🔗 Visit https://remotedesktop.google.com/headless to authorize"
-  echo "::notice::🔑 Your CRD PIN is: ${PIN}"
+if [[ ! -x "$START_HOST" ]]; then
+  echo "ERROR: start-host utility not found:"
+  echo "$START_HOST"
+  exit 1
 fi
 
-# Wait for the user to authorize (credentials file will appear)
-echo ""
-echo "⏳ Waiting for you to authorize (checking every 5 seconds)..."
-AUTH_WAIT=180  # 3 minutes to authorize
+echo "Starting first-time Chrome Remote Desktop authorization..."
 
-for i in $(seq 1 $((AUTH_WAIT / 5))); do
-  if [ -f "$CRD_DIR/Credentials" ] && [ -s "$CRD_DIR/Credentials" ]; then
-    echo ""
-    echo "✅ Authorization detected! CRD is now linked to your Google account."
-    echo "   🔗 Connect at: https://remotedesktop.google.com/access"
-    echo "   🔑 PIN: ${PIN}"
-    echo ""
-    echo "   💡 Next time you run this, authorization will be instant!"
+# Run Google's documented headless setup command.
+set +e
+DISPLAY= "$START_HOST" \
+  --code="$AUTH_CODE" \
+  --redirect-url="$REDIRECT_URL" \
+  --name="$HOST_NAME" \
+  --pin="$PIN" \
+  >/tmp/crd-setup.log 2>&1
+SETUP_STATUS=$?
+set -e
+
+unset AUTH_CODE
+
+if [[ $SETUP_STATUS -ne 0 ]]; then
+  echo "ERROR: CRD authorization/setup failed."
+  echo "The authorization code may have expired or already been used."
+  echo "Generate a fresh code at:"
+  echo "https://remotedesktop.google.com/headless"
+  echo "Check /tmp/crd-setup.log for diagnostics."
+  exit "$SETUP_STATUS"
+fi
+
+# Verify credentials were created
+for _ in $(seq 1 30); do
+  if [[ -s "$CRD_DIR/Credentials" ]]; then
+    chmod 600 "$CRD_DIR/Credentials"
+    echo "Chrome Remote Desktop authorization completed."
+    echo "Connect at: https://remotedesktop.google.com/access"
+    echo "Look for: $HOST_NAME"
     exit 0
   fi
-  echo -n "."
-  sleep 5
+  sleep 2
 done
 
-echo ""
-echo "⚠️  Authorization timed out. Don't worry — your VPS is still running!"
-echo "   Try connecting at https://remotedesktop.google.com/access anyway."
-echo "   If it doesn't work, re-run the workflow and authorize faster."
+echo "ERROR: Setup returned, but Credentials file was not found."
+echo "Check /tmp/crd-setup.log."
+exit 1
