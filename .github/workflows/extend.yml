@@ -25,6 +25,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      # ── CONFIGURE GIT IDENTITY (fix for "Author identity unknown") ──
+      - name: 🪪 Configure Git Identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       # ── NORMALIZE INPUTS ──────────────────────────────────────
       - name: 🔄 Normalize Inputs
         run: |
